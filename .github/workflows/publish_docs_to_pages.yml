@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - main
+    tags:
+      - v*
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-and-deploy:
     if: github.repository_owner == 'numpy'
     runs-on: ubuntu-latest
     steps:
@@ -24,32 +26,157 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install .[doc]
+    - name: Determine docs version
+      id: version
+      run: |
+        if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          # Extract version from tag (e.g., v1.2.0 -> 1.2.0)
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is_release=true" >> $GITHUB_OUTPUT
+          echo "docs_path=version/$VERSION" >> $GITHUB_OUTPUT
+        else
+          echo "version=dev" >> $GITHUB_OUTPUT
+          echo "is_release=false" >> $GITHUB_OUTPUT
+          echo "docs_path=dev" >> $GITHUB_OUTPUT
+        fi
     - name: Build documentation with Sphinx
+      env:
+        DOCS_VERSION: ${{ steps.version.outputs.version }}
       run: |
         cd doc
         make html
-        mv build/html /tmp
+        mv build/html /tmp/html
         cd ..
     - name: Deploy to gh-pages branch
+      env:
+        DOCS_PATH: ${{ steps.version.outputs.docs_path }}
+        IS_RELEASE: ${{ steps.version.outputs.is_release }}
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
         git config user.name "${GITHUB_ACTOR}"
         git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
         echo "Checking out gh-pages branch"
         git fetch origin gh-pages
         git checkout gh-pages
-        echo "Removing old dev documentation"
-        git clean -xdf .
-        cd dev
-        git rm -r '*'
-        cd ..
-        echo "Committing emptied dev directory"
-        git commit -m "Remove old dev documentation"
-        mkdir -p dev
-        cd dev
-        echo "Copying /tmp/html here"
-        cp -v -r /tmp/html/* .
-        echo "Adding new dev documentation"
+        
+        echo "Deploying docs to $DOCS_PATH"
+        
+        if [ "$IS_RELEASE" = "true" ]; then
+          # For releases, create new version directory
+          mkdir -p "$DOCS_PATH"
+          rm -rf "${DOCS_PATH:?}"/*
+        else
+          # For dev builds, clean and recreate dev directory
+          git clean -xdf .
+          if [ -d "dev" ]; then
+            cd dev
+            git rm -r '*' || true
+            cd ..
+            git commit -m "Remove old dev documentation" || true
+          fi
+          mkdir -p dev
+        fi
+        
+        # Copy the built docs
+        cp -r /tmp/html/* "$DOCS_PATH/"
+        
+        # For releases, update versions.json at the root of gh-pages
+        if [ "$IS_RELEASE" = "true" ]; then
+          echo "Updating versions.json for release $VERSION"
+          python3 << 'EOF'
+        import json
+        import os
+        
+        version = os.environ['VERSION']
+        versions_file = '_static/versions.json'
+        
+        # Read existing versions.json or start fresh
+        if os.path.exists(versions_file):
+            with open(versions_file, 'r') as f:
+                versions = json.load(f)
+        else:
+            versions = []
+        
+        # Create entry for new version
+        new_entry = {
+            "name": version,
+            "version": version,
+            "url": f"https://numpy.org/numpy-financial/version/{version}/"
+        }
+        
+        # Check if this version already exists (update it) or add new
+        version_exists = False
+        for v in versions:
+            if v.get('version') == version:
+                v.update(new_entry)
+                version_exists = True
+                break
+        
+        if not version_exists:
+            # Insert after dev (index 1) or at the beginning if no dev
+            dev_index = next((i for i, v in enumerate(versions) if v.get('version') == 'dev'), -1)
+            insert_index = dev_index + 1 if dev_index >= 0 else 0
+            versions.insert(insert_index, new_entry)
+        
+        # Update "preferred" flag - newest release should be preferred
+        # First, remove preferred from all non-dev entries
+        for v in versions:
+            if v.get('version') != 'dev' and 'preferred' in v:
+                del v['preferred']
+        
+        # Find the highest version (excluding dev) and mark it as preferred
+        from packaging.version import Version, InvalidVersion
+        release_versions = []
+        for v in versions:
+            ver = v.get('version', '')
+            if ver != 'dev':
+                try:
+                    release_versions.append((Version(ver), v))
+                except InvalidVersion:
+                    pass
+        
+        if release_versions:
+            release_versions.sort(key=lambda x: x[0], reverse=True)
+            highest = release_versions[0][1]
+            highest['preferred'] = True
+            # Update the name to indicate stable
+            highest['name'] = f"{highest['version']} (stable)"
+        
+        # Ensure dev is always first
+        versions.sort(key=lambda v: (0 if v.get('version') == 'dev' else 1, v.get('version', '')), reverse=False)
+        # Re-sort releases by version descending (dev stays first)
+        dev_entry = [v for v in versions if v.get('version') == 'dev']
+        release_entries = [v for v in versions if v.get('version') != 'dev']
+        try:
+            release_entries.sort(key=lambda v: Version(v.get('version', '0')), reverse=True)
+        except:
+            pass
+        versions = dev_entry + release_entries
+        
+        # Write updated versions.json
+        os.makedirs('_static', exist_ok=True)
+        with open(versions_file, 'w') as f:
+            json.dump(versions, f, indent=4)
+        EOF
+          
+          # Also copy versions.json to the new version's _static directory
+          # so it's available when viewing that version's docs
+          cp _static/versions.json "$DOCS_PATH/_static/versions.json"
+          
+          # Update 'latest' symlink to point to the new version
+          rm -f latest
+          ln -s "version/$VERSION" latest
+          git add latest
+        fi
+        
+        # Stage and commit changes
         git add -A .
-        git commit -m "Add new dev documentation"
-        echo "Pushing new documentation to origin"
+        if [ "$IS_RELEASE" = "true" ]; then
+          git commit -m "Add documentation for version $VERSION"
+        else
+          git commit -m "Update dev documentation"
+        fi
+        
+        echo "Pushing documentation to origin"
         git push -v origin gh-pages
